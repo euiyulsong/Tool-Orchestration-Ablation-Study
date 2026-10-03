@@ -679,3 +679,122 @@ B conditional fallback
 > **실제 function call을 중간에 출력하고 같은 generation에서 다시 text를 이어 쓰는 A 방식은 50개 모두 실패했고, tool result를 이미 알고 전체 `text → widget → text` plan을 한 번에 생성하는 D 방식은 훨씬 낮은 latency와 token으로 비슷한 post-widget UX를 만들 수 있었다.**
 
 이게 현재 결과에서 가장 중요한 결론이다.
+
+## 16. A–D 프롬프트 요약
+
+### A. One-shot interleaved
+
+목표: **Tool result를 이미 받은 상태에서 한 generation 안에 `text → widget call → text`까지 끝내기**
+
+```text
+You are composing the final response after the data tool has completed.
+
+Use the completed tool result as the source of truth.
+
+If a UI widget helps:
+1. write natural text before it,
+2. call `render_widget`,
+3. if possible, continue naturally after the widget in the same response.
+
+Do not use canned transitions or fixed conclusion phrases.
+```
+
+---
+
+### B. Widget then continuation
+
+목표: **첫 generation에서 widget까지 만들고, widget 이후는 두 번째 generation으로 자연스럽게 이어쓰기**
+
+#### B-1. Widget 전
+
+```text
+The data tool has completed.
+
+Write only the natural text that belongs before the widget, then call
+`render_widget` if useful.
+
+Do not write placeholder text for what comes after the widget.
+Do not force a conclusion yet.
+```
+
+#### B-2. Continuation
+
+```text
+Continue the same assistant response naturally from immediately after
+the rendered widget.
+
+Use the original request, completed tool result, previous text, and widget state.
+
+Do not restart or repeat the answer.
+Add only what naturally belongs after the widget.
+If nothing useful remains, return nothing.
+```
+
+---
+
+### C. Separate widget planner
+
+목표: **답변 생성과 widget 선택을 별도 단계로 분리**
+
+#### C-1. Pre-text
+
+```text
+Using the completed tool result, write only the natural text that should
+appear before a possible UI widget.
+
+Do not add post-widget conclusions yet.
+```
+
+#### C-2. Widget planner
+
+```text
+Decide whether a UI widget materially improves the response.
+
+If useful, call `render_widget` with the best widget.
+Otherwise choose no widget.
+
+Do not write user-facing prose.
+Use only the completed tool result.
+```
+
+#### C-3. Continuation
+
+```text
+Continue the same response naturally after the rendered widget.
+
+Do not restart or repeat the answer.
+Only add information that is still useful.
+```
+
+---
+
+### D. Whole response plan
+
+목표: **Tool result를 이미 본 상태에서 `pre_text + widget + post_text`를 한 번에 계획**
+
+```text
+The data tool has already completed.
+
+Create the entire ordered UI response in one generation:
+
+- pre_text: natural text before the widget
+- widget_request: the best UI component, or none
+- post_text: natural text after the widget
+
+Ground everything in the completed tool result.
+Do not use canned wording.
+Use no widget when plain text is clearer.
+```
+
+---
+
+## 한 줄 비교
+
+```text
+A: result → [text + actual widget call + text] in one generation
+B: result → [text + widget] → second-generation continuation
+C: result → text → separate widget planner → continuation
+D: result → [pre_text + widget_request + post_text] as one response plan
+```
+
+현재 실험 결과와 가장 잘 맞는 production 후보는 **D를 기본 fast path로 쓰고, widget 실행 후 새로운 상태가 생길 때만 B continuation을 사용하는 구조**야.
