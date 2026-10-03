@@ -798,3 +798,370 @@ D: result → [pre_text + widget_request + post_text] as one response plan
 ```
 
 현재 실험 결과와 가장 잘 맞는 production 후보는 **D를 기본 fast path로 쓰고, widget 실행 후 새로운 상태가 생길 때만 B continuation을 사용하는 구조**야.
+
+## 17. 실제 Output 예시로 본 A–D 차이
+
+아래는 같은 query와 같은 data-tool result에서 A–D가 실제로 어떻게 달라졌는지 보여주는 대표 예시다. 
+
+### 예시 Query
+
+> Los Angeles, San Francisco, Seattle에서 밤 10시 이후까지 영업하는 vegan restaurant를 찾아줘.
+
+공통 data tool은 세 도시 각각에 대해 3개씩 후보를 반환했다. 다만 mock dataset 특성상 실제 상호명이나 영업시간 세부정보는 부족했다. 
+
+### A. One-shot interleaved
+
+실제 output은 거의:
+
+```text
+[widget call: table]
+```
+
+형태였다.
+
+- `pre_text`: 없음
+- widget: 있음
+- `post_text`: 없음
+- same-generation post-widget text: `False`
+
+즉 우리가 기대했던:
+
+```text
+텍스트
+[Widget]
+추가 텍스트
+```
+
+가 아니라:
+
+```text
+[Widget]
+```
+
+에서 generation이 사실상 끝났다. 
+
+이게 A를 production에서 조심해야 한다고 본 핵심 이유다.
+
+---
+
+### B. Widget then continuation
+
+첫 generation:
+
+```text
+I found three matches in each city for restaurants listed as open
+until at least 22:00. The available results don’t include addresses
+or specific hours, so please verify today’s closing time before
+heading out.
+
+[Table Widget]
+```
+
+그 후 continuation call을 한 번 더 했지만, 이 sample에서는 **추가할 내용이 없다고 판단해서 post-text를 생성하지 않았다.** 
+
+즉 B는 항상 text를 억지로 붙이는 게 아니라:
+
+```text
+text
+→ widget
+→ second LLM
+→ "더 할 말 없음"
+```
+
+도 가능하다.
+
+이게 꽤 좋은 특성이다.
+
+---
+
+### C. Separate widget planner
+
+첫 answer generator:
+
+```text
+I can’t provide reliable restaurant recommendations from these
+results: they contain placeholder names and no addresses or opening
+hours. Check current listings for each city...
+```
+
+그 다음 별도 widget planner는:
+
+```text
+widget_type = none
+```
+
+을 선택했다.
+
+마지막 continuation도 비어 있었다. 
+
+결과적으로:
+
+```text
+답변
+→ widget 없음
+→ continuation 없음
+```
+
+이 됐다.
+
+품질은 합리적이지만 **LLM을 3번 호출해서 결국 plain text 하나만 얻은 셈**이라 orchestration cost가 과하다.
+
+---
+
+### D. Whole response plan
+
+D는 한 번의 generation에서:
+
+```text
+pre_text:
+I found three matches in each city for vegan restaurants listed as
+open until at least 22:00. The available results don’t include
+restaurant names or verified closing times...
+
+widget:
+Table
+- Los Angeles: 3 matches
+- San Francisco: 3 matches
+- Seattle: 3 matches
+
+post_text:
+The listings returned only generic result labels rather than actual
+business details. Check a current maps or restaurant directory...
+```
+
+를 한꺼번에 만들었다. 
+
+즉 frontend에서는 그대로:
+
+```text
+설명
+
+[Table Widget]
+
+추가 설명
+```
+
+으로 렌더하면 된다.
+
+이래서 D를 효율적인 후보로 본 거다.
+
+---
+
+## 또 다른 예시: DB Update
+
+Query:
+
+> user id 43523의 이름과 이메일을 업데이트해줘.
+
+공통 tool result는 `simulated_success`와 confirmation id를 반환했다. 
+
+### A
+
+```text
+Updated the customer information for user 43523...
+Confirmation ID: mock-31223.
+```
+
+Widget 없이 text만 반환했다.
+
+### B
+
+```text
+Customer information ...
+[status/result widget]
+```
+
+이후 continuation은 필요 없다고 판단할 수 있다.
+
+### C
+
+```text
+Update completed ...
+→ widget planner
+→ status widget
+→ continuation 없음
+```
+
+3-call 구조라 비용이 크다.
+
+### D
+
+한 generation에서:
+
+```text
+pre_text:
+Customer information was updated successfully.
+
+widget:
+status/result
+
+post_text:
+(optional / empty)
+```
+
+형태로 전체 UI를 계획할 수 있다.
+
+이런 케이스에서는 **tool result가 이미 완료된 상태이므로 D가 success를 안전하게 반영할 수 있다.**
+
+---
+
+## 세 번째 예시: Linear Regression
+
+Query:
+
+> Age, Income, Education으로 Purchase Amount를 예측하는 linear regression을 돌려줘.
+
+공통 tool result는 성공 여부와 mock result만 반환했다. 
+
+### A
+
+```text
+[result widget]
+```
+
+- pre-text 없음
+- post-text 없음
+
+### B
+
+```text
+The linear regression was run with Purchase_Amount as the target
+and Age, Income, Education as predictors. Standardization was applied.
+
+[result widget]
+```
+
+Continuation은 비어 있었다.
+
+### C
+
+```text
+Linear regression was completed...
+[status widget]
+```
+
+마지막 continuation 없음.
+
+### D
+
+```text
+pre_text:
+The linear regression completed successfully using standardized
+predictor variables.
+
+widget:
+Linear regression result
+
+post_text:
+(empty)
+```
+
+여기서 중요한 포인트는 **post-text가 항상 필요한 게 아니라는 것**이다.
+
+D의 장점은 `text-widget-text`를 강제로 만드는 게 아니라,
+
+```text
+pre_text
+widget
+post_text(optional)
+```
+
+전체 구조를 한 번에 결정할 수 있다는 점이다.
+
+---
+
+## 네 번째 예시: 결과가 불충분한 factual lookup
+
+Query:
+
+> Albert Einstein's contribution to science on March 17, 1915?
+
+공통 tool result가 실제 historical fact 대신 placeholder만 반환했다. 
+
+### A
+
+```text
+The available record doesn’t identify a specific scientific
+contribution...
+```
+
+Widget 없음.
+
+### B
+
+```text
+I can’t verify a specific scientific contribution...
+```
+
+Widget 없음, continuation도 없음.
+
+### C
+
+```text
+I can’t verify a historical contribution...
+```
+
+Widget planner가 `none`, continuation 없음.
+
+### D
+
+```text
+pre_text:
+The available result does not identify a specific scientific
+contribution for that date.
+
+widget:
+Result
+  status: No verifiable contribution returned
+
+post_text:
+I can’t reliably say what Einstein contributed on March 17, 1915
+based on this result.
+```
+
+이 사례는 D의 약점도 보여준다.
+
+A/B/C는 **widget이 필요 없다고 판단**했는데, D는 굳이 `result` widget을 넣었다.
+
+즉 D의 94% widget rate는 일부 **over-widgeting**이 섞여 있을 가능성이 높다.
+
+---
+
+## 이 예시들 때문에 내린 판단
+
+결과를 보면 구조적 차이가 명확하다.
+
+```text
+A
+실제 function call을 중간에 넣음
+→ function call 뒤 same-generation text가 안 나옴
+
+B
+widget까지 생성
+→ 필요하면 second LLM continuation
+→ 가장 robust
+
+C
+answer / widget planner / continuation 분리
+→ 제어력은 높지만 호출 수가 과함
+
+D
+tool result를 이미 본 상태에서
+pre_text + widget + post_text 전체를 한 번에 계획
+→ 빠르고 text-widget-text 구성도 쉬움
+→ 다만 widget을 너무 자주 넣을 위험 있음
+```
+
+그래서 production 관점에서는 여전히:
+
+```text
+기본:
+D = whole-response planning
+
+예외:
+widget 실행 이후 새로운 상태가 생기거나
+실패/성공을 다시 확인해야 하면
+→ B continuation
+```
+
+조합이 가장 현실적으로 보인다.
